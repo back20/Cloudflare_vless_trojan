@@ -1,0 +1,131 @@
+name: Execute SSH Commands
+
+on:
+  workflow_dispatch:  # 手动触发工作流
+  schedule:
+    - cron: "1 1,13 * * *"  # 每天北京时间 9:00 AM 和 9:00 PM 执行（对应 UTC 1:00 AM 和 1:00 PM）
+
+jobs:
+  execute-commands:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSHPass
+        run: sudo apt-get update && sudo apt-get install -y sshpass curl jq netcat-openbsd cron
+
+      - name: Get ACCOUNTS_JSON
+        id: get-accounts
+        run: |
+          echo "$ACCOUNTS_JSON" > accounts.json
+        env:
+          ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
+
+      - name: Run Keep-Alive Script
+        run: |
+          #!/bin/bash
+          # 获取 ACCOUNTS_JSON
+          echo "$ACCOUNTS_JSON" > accounts.json  # 从 GitHub Secrets 获取并保存到 accounts.json 文件
+
+          # 解析服务器配置
+          declare -A servers
+
+          while IFS= read -r account; do
+              username=$(echo "$account" | jq -r '.username')
+              password=$(echo "$account" | jq -r '.password')
+              ssh=$(echo "$account" | jq -r '.ssh')
+              suuid=$(echo "$account" | jq -r '.suuid')
+              tcp1_port=$(echo "$account" | jq -r '.tcp1_port')
+              tcp2_port=$(echo "$account" | jq -r '.tcp2_port')
+              udp_port=$(echo "$account" | jq -r '.udp_port')
+              argo_domain=$(echo "$account" | jq -r '.argo_domain')
+              argo_auth=$(echo "$account" | jq -r '.argo_auth')
+
+              servers["$ssh"]="$username:$password:$suuid:$tcp1_port:$tcp2_port:$udp_port:$argo_domain:$argo_auth"
+          done < <(jq -c '.[]' accounts.json)
+
+          # 定义颜色
+          red() { echo -e "\e[1;91m$1\033[0m"; }
+          green() { echo -e "\e[1;32m$1\033[0m"; }
+          yellow() { echo -e "\e[1;33m$1\033[0m"; }
+          purple() { echo -e "\e[1;35m$1\033[0m"; }
+
+          export TERM=xterm
+          export DEBIAN_FRONTEND=noninteractive
+
+          install_packages() {
+              if [ -f /etc/debian_version ]; then
+                  package_manager="apt-get install -y"
+              elif [ -f /etc/redhat-release ]; then
+                  package_manager="yum install -y"
+              elif [ -f /etc/fedora-release ]; then
+                  package_manager="dnf install -y"
+              elif [ -f /etc/alpine-release ]; then
+                  package_manager="apk add"
+              else
+                  red "不支持的系统架构！"
+                  exit 1
+              fi
+              $package_manager sshpass curl netcat-openbsd jq cron >/dev/null 2>&1 &
+          }
+          install_packages
+          clear
+
+          # 添加定时任务
+          add_cron_job() {
+              if [ -f /etc/alpine-release ]; then
+                  if ! command -v crond >/dev/null 2>&1; then
+                      apk add --no-cache cronie bash >/dev/null 2>&1 &
+                      rc-update add crond && rc-service crond start
+                  fi
+              fi
+              # 检查定时任务是否已经存在
+              if ! crontab -l 2>/dev/null | grep -q "$SCRIPT_PATH"; then
+                  (crontab -l 2>/dev/null; echo "*/2 * * * * /bin/bash $SCRIPT_PATH >> /root/keep_00.log 2>&1") | crontab -
+                  green "已添加计划任务，每两分钟执行一次"
+              else
+                  purple "计划任务已存在，跳过添加计划任务"
+              fi
+          }
+          add_cron_job
+
+          # 检查 TCP 端口是否通畅
+          check_tcp_port() {
+              local host=$1
+              local port=$2
+              nc -z -w 3 "$host" "$port" &> /dev/null
+              return $?
+          }
+
+          # 检查 Argo 隧道是否在线
+          check_argo_tunnel() {
+              local domain=$1
+              if [ -z "$domain" ]; then
+                  return 1
+              else
+                  http_code=$(curl -o /dev/null -s -w "%{http_code}\n" "https://$domain")
+                  if [ "$http_code" -eq 404 ]; then
+                      return 0
+                  else
+                      return 1
+                  fi
+              fi
+          }
+
+          # 执行远程命令
+          run_remote_command() {
+              local host=$1
+              local ssh_user=$2
+              local ssh_pass=$3
+              local suuid=$4
+              local tcp1_port=$5
+              local tcp2_port=$6
+              local udp_port=$7
+              local argo_domain=${8}
+              local argo_auth=${9}
+
+              remote_command="UUID=$suuid vless_port=$tcp1_port vmess_port=$tcp2_port hy2_port=$udp_port ARGO_DOMAIN=$argo_domain ARGO_AUTH='$argo_auth' bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/Cloudflare_vless_trojan/main/serv00keep.sh)"
+     
+              sshpass -p "$ssh_pass" ssh -o StrictHostKeyChecking=no "$ssh_user@$host" "$remote_command"
+          }
+
+          # 循环遍历服务器列表检测
+          for host in "${!servers[
